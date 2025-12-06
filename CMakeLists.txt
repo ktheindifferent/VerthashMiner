@@ -240,31 +240,43 @@ if(USE_OPENSSL)
 endif()
 
 # -----------------------------------------------------------------------------
+# Metal support for macOS
+if(APPLE)
+    option(USE_METAL "Use Metal for GPU acceleration on macOS" ON)
+    if(USE_METAL)
+        add_definitions(-DHAVE_METAL)
+        message("INFO: Building with Metal support for macOS")
+    endif()
+endif()
+
+# -----------------------------------------------------------------------------
+set(COMMON_SOURCES
+    src/external/tiny_sha3/sha3.c
+    src/external/tinycthread/tinycthread.c
+    src/vhCore/ConfigFile.cpp
+    src/vhCore/Util.cpp
+    src/vhCore/Verthash.cpp
+    src/vhDevice/ADLUtils.cpp
+    src/vhDevice/NVMLUtils.cpp
+    src/vhDevice/SYSFSUtils.cpp
+    src/main.cpp
+)
+
 if(CUDA_FOUND AND USE_CUDA)
-CUDA_ADD_EXECUTABLE(VerthashMiner
-    src/vhCuda/verthash.cu
-    src/external/tiny_sha3/sha3.c
-    src/external/tinycthread/tinycthread.c
-    src/vhCore/ConfigFile.cpp
-    src/vhCore/Util.cpp
-    src/vhCore/Verthash.cpp
-    src/vhDevice/ADLUtils.cpp
-    src/vhDevice/NVMLUtils.cpp
-    src/vhDevice/SYSFSUtils.cpp
-    src/main.cpp
-)
+    CUDA_ADD_EXECUTABLE(VerthashMiner
+        src/vhCuda/verthash.cu
+        ${COMMON_SOURCES}
+    )
+elseif(APPLE AND USE_METAL)
+    add_executable(VerthashMiner
+        ${COMMON_SOURCES}
+        src/vhMetal/MetalUtils.mm
+    )
+    set_source_files_properties(src/vhMetal/MetalUtils.mm PROPERTIES COMPILE_FLAGS "-x objective-c++")
 else()
-add_executable(VerthashMiner
-    src/external/tiny_sha3/sha3.c
-    src/external/tinycthread/tinycthread.c
-    src/vhCore/ConfigFile.cpp
-    src/vhCore/Util.cpp
-    src/vhCore/Verthash.cpp
-    src/vhDevice/ADLUtils.cpp
-    src/vhDevice/NVMLUtils.cpp
-    src/vhDevice/SYSFSUtils.cpp
-    src/main.cpp
-)
+    add_executable(VerthashMiner
+        ${COMMON_SOURCES}
+    )
 endif()
 
 
@@ -296,7 +308,17 @@ else()
             if(USE_OPENSSL_STATIC)
                 target_link_libraries(VerthashMiner
                                       rt)
-            endif()                                  
+            endif()
+        endif()
+
+        # Metal framework for macOS
+        if(APPLE AND USE_METAL)
+            find_library(METAL_LIBRARY Metal)
+            find_library(FOUNDATION_LIBRARY Foundation)
+            target_link_libraries(VerthashMiner
+                                  ${METAL_LIBRARY}
+                                  ${FOUNDATION_LIBRARY})
+            message("INFO: Linking with Metal framework")
         endif()
     endif()
 endif()
@@ -310,4 +332,9 @@ install(
 )
 
 INSTALL(DIRECTORY "${CMAKE_SOURCE_DIR}/src/kernels/" DESTINATION "${CMAKE_INSTALL_PREFIX}/kernels")
+
+# Install Metal kernels if on macOS
+if(APPLE AND USE_METAL)
+    INSTALL(DIRECTORY "${CMAKE_SOURCE_DIR}/src/kernels-metal/" DESTINATION "${CMAKE_INSTALL_PREFIX}/kernels-metal")
+endif()
 

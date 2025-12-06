@@ -2639,6 +2639,23 @@ struct cuworker_t
     int deviceMonitor;
 };
 
+//-----------------------------------------------------------------------------
+// Metal worker thread
+struct mtlworker_t
+{
+    struct thr_info* threadInfo;
+#ifdef HAVE_METAL
+    mtldevice_t mtldevice;
+#endif
+    size_t workSize;
+    uint32_t batchTimeMs;
+    uint32_t occupancyPct;
+
+    // monitoring
+    int gpuTemperatureLimit;
+    int deviceMonitor;
+};
+
 static int verthashCuda_thread(void *userdata)
 {
     if (opt_debug)
@@ -3508,20 +3525,6 @@ out:
 //-----------------------------------------------------------------------------
 // Metal worker thread
 #ifdef HAVE_METAL
-
-struct mtlworker_t
-{
-    struct thr_info* threadInfo;
-    mtldevice_t mtldevice;
-    size_t workSize;
-    uint32_t batchTimeMs;
-    uint32_t occupancyPct;
-
-    // monitoring
-    int gpuTemperatureLimit;
-    int deviceMonitor;
-};
-
 static int verthashMetal_thread(void *userdata)
 {
     if (opt_debug)
@@ -3545,6 +3548,7 @@ static int verthashMetal_thread(void *userdata)
     if (mtl_allocate_buffers(dev, vh_data_size, workSize) != 0)
     {
         applog(LOG_ERR, "MTL: Failed to allocate buffers");
+        free(vh_data);
         return 1;
     }
 
@@ -3553,6 +3557,7 @@ static int verthashMetal_thread(void *userdata)
 
     FILE* fp = fopen(kernelPath, "r");
     if (!fp) {
+        applog(LOG_ERR, "MTL: Failed to open kernel file: %s", kernelPath);
         free(vh_data);
         return 1;
     }
@@ -3569,6 +3574,7 @@ static int verthashMetal_thread(void *userdata)
     if (mtl_create_compute_pipeline(dev, kernelSource, kernelSize) != 0)
     {
         applog(LOG_ERR, "MTL: Failed to create compute pipeline");
+        free(kernelSource);
         free(vh_data);
         return 1;
     }
@@ -3579,6 +3585,7 @@ static int verthashMetal_thread(void *userdata)
     // Allocate host buffers
     uint32_t* h_results = (uint32_t*)calloc(workSize + 1, sizeof(uint32_t));
     if (!h_results) {
+        applog(LOG_ERR, "MTL: Failed to allocate results buffer");
         free(vh_data);
         mtl_cleanup_device(dev);
         return 1;
@@ -5312,7 +5319,7 @@ int utf8_main(int argc, char *argv[])
         {
             mtlworker_t mtlworker;
             mtlworker.mtldevice = mtldevices[i];
-            mtlworker.workSize = 65536;  // Maximum workSize for discrete GPU performance
+            mtlworker.workSize = vh::defaultWorkSize;  // 4096 by default
             mtlworker.batchTimeMs = vh::defaultBatchTimeMs;
             mtlworker.occupancyPct = vh::defaultOccupancyPct;
             mtlworker.gpuTemperatureLimit = vh::defaultGPUTemperatureLimit;
