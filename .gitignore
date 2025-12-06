@@ -1,0 +1,32 @@
+# Build directory
+build/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Compiled binaries
+*.o
+*.a
+*.so
+*.dylib
+VerthashMiner
+
+# IDE files
+.vscode/
+.idea/
+*.xcodeproj/
+*.xcworkspace/
+
+# macOS
+.DS_Store
+
+# Verthash data file (large)
+*.dat
+
+# Editor backup files
+*~
+*.swp
+*.swo

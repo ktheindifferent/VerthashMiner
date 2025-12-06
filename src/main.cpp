@@ -3541,19 +3541,12 @@ static int verthashMetal_thread(void *userdata)
     uint8_t* vh_data = verthashInfo.data;
     size_t vh_data_size = verthashInfo.dataSize;
 
-    // Allocate Metal buffers
-    if (mtl_allocate_buffers(dev, vh_data_size, workSize) != 0)
-    {
-        applog(LOG_ERR, "MTL: Failed to allocate buffers");
-        return 1;
-    }
-
-    // Load Metal kernel
+    // Load Metal kernel source
     const char* kernelPath = "kernels-metal/verthash.metal";
 
     FILE* fp = fopen(kernelPath, "r");
     if (!fp) {
-        free(vh_data);
+        applog(LOG_ERR, "MTL: Failed to open kernel file: %s", kernelPath);
         return 1;
     }
 
@@ -3565,109 +3558,166 @@ static int verthashMetal_thread(void *userdata)
     kernelSource[kernelSize] = '\0';
     fclose(fp);
 
-    // Create compute pipeline
-    if (mtl_create_compute_pipeline(dev, kernelSource, kernelSize) != 0)
+    // Create all compute pipelines (precompute, sha3, verthash)
+    if (mtl_create_pipelines(dev, kernelSource, kernelSize) != 0)
     {
-        applog(LOG_ERR, "MTL: Failed to create compute pipeline");
-        free(vh_data);
+        applog(LOG_ERR, "MTL: Failed to create compute pipelines");
+        free(kernelSource);
         return 1;
     }
     free(kernelSource);
 
-    applog(LOG_INFO, "MTL: Metal device initialized: %s", dev->deviceName);
-
-    // Allocate host buffers
-    uint32_t* h_results = (uint32_t*)calloc(workSize + 1, sizeof(uint32_t));
-    if (!h_results) {
-        free(vh_data);
+    // Allocate Metal buffers
+    if (mtl_allocate_buffers(dev, vh_data_size, workSize) != 0)
+    {
+        applog(LOG_ERR, "MTL: Failed to allocate buffers");
         mtl_cleanup_device(dev);
         return 1;
     }
 
+    // Upload verthash data to GPU
+    if (mtl_upload_verthash_data(dev, vh_data, vh_data_size) != 0)
+    {
+        applog(LOG_ERR, "MTL: Failed to upload verthash data");
+        mtl_cleanup_device(dev);
+        return 1;
+    }
+
+    applog(LOG_INFO, "MTL: Metal device initialized: %s", dev->deviceName);
+
+    // Host buffer for found nonces
+    uint32_t foundNonces[16];
+
     // Main mining loop
     uint64_t hashes_done_count = 0;
     auto hrTimerStart = std::chrono::steady_clock::now();
+    uint32_t lastJobId = 0;  // Track when we need to run precompute
 
-    while (1)
+    while (!abort_flag)
     {
-        struct work work;
-        bool work_valid = get_work(mythr, &work);
-
-        if (!work_valid)
+        // Stratum
+        if (have_stratum)
         {
-            applog(LOG_ERR, "MTL: work retrieval failed, exiting mining thread %d", thr_id);
-            break;
-        }
-
-        if (work_restart[thr_id].restart)
-        {
-            work_restart[thr_id].restart = 0;
-        }
-
-        uint32_t start_nonce = work.data[19];
-        uint32_t max_nonce = work.data[19] + (workSize * 4); // 4-way kernel
-        uint64_t target = ((uint64_t*)work.target)[3];
-
-        // Execute kernel (simplified - full implementation would prepare kStates)
-        uint32_t* dummy_hashes = (uint32_t*)calloc(workSize * 8, sizeof(uint32_t));
-        uint32_t* dummy_kstates = (uint32_t*)calloc((workSize/4) * 50 * 2, sizeof(uint32_t));
-
-        int result = mtl_execute_verthash_kernel(
-            dev,
-            dummy_hashes,
-            dummy_kstates,
-            vh_data,
-            work.data[18],
-            start_nonce,
-            h_results,
-            target,
-            workSize
-        );
-
-        free(dummy_hashes);
-        free(dummy_kstates);
-
-        if (result != 0) {
-            applog(LOG_ERR, "MTL: Kernel execution failed");
-            break;
-        }
-
-        // Check for results
-        uint32_t foundCount = h_results[0];
-        if (foundCount > 0 && foundCount < 16)
-        {
-            for (uint32_t i = 0; i < foundCount; i++)
+            while (time(NULL) >= g_work_time + 120)
             {
-                uint32_t nonce = h_results[i + 1];
-                work.data[19] = start_nonce + (nonce * 4);
+                if (abort_flag) { goto out; }
+                sleep_ms(1);
+            }
 
-                if (submit_work(mythr, &work))
+            mtx_lock(&g_work_lock);
+            stratum_gen_work(&stratum, &g_work);
+        }
+        else // GBT
+        {
+            // obtain new work from internal workio thread
+            mtx_lock(&g_work_lock);
+
+            work_free(&g_work);
+            if (unlikely(!get_work(mythr, &g_work)))
+            {
+                if (!abort_flag) { applog(LOG_ERR, "MTL: Work retrieval failed, exiting mining thread %d", thr_id); }
+                mtx_unlock(&g_work_lock);
+                goto out;
+            }
+
+            g_work_time = time(NULL);
+        }
+
+        // Create a work copy
+        struct work workInfo;
+        work_copy(&workInfo, &g_work);
+        workInfo.data[19] = 0;
+
+        work_restart[thr_id].restart = 0;
+        mtx_unlock(&g_work_lock);
+
+        // Prepare block header (big endian encoded)
+        uint32_t uheader[20] = {0};
+        for (size_t i = 0; i < 20; ++i)
+        {
+            be32enc(&uheader[i], workInfo.data[i]);
+        }
+
+        // Run precompute once per new job (computes 8 keccak states from header)
+        // The precompute is based on header[0..17], so we run it when header changes
+        mtl_run_precompute(dev, uheader);
+
+        // Target for extended validation (64-bit)
+        uint64_t target = ((uint64_t(workInfo.target[7])) << 32) | (uint64_t(workInfo.target[6]) & 0xFFFFFFFFUL);
+
+        // Mining loop for this work unit
+        uint64_t nonce64 = 0;
+        uint64_t maxNonce = 0xFFFFFFFFULL;
+
+        while (!work_restart[thr_id].restart && (!abort_flag))
+        {
+            uint32_t nonce = (uint32_t)nonce64;
+            uint32_t in18 = uheader[18];
+
+            // Run mining batch (SHA3-256 + Verthash kernels)
+            uint32_t foundCount = 0;
+            int result = mtl_run_mining_batch(
+                dev,
+                in18,
+                nonce,
+                target,
+                workSize,
+                &foundCount,
+                foundNonces
+            );
+
+            if (result != 0) {
+                applog(LOG_ERR, "MTL: Kernel execution failed");
+                goto out;
+            }
+
+            // Check for valid results
+            if (foundCount > 0 && foundCount < 16)
+            {
+                for (uint32_t i = 0; i < foundCount; i++)
                 {
-                    applog(LOG_INFO, "MTL: Accepted share!");
+                    uint32_t foundNonce = foundNonces[i];
+                    workInfo.data[19] = nonce + (foundNonce * 4);  // 4-way kernel
+
+                    if (submit_work(mythr, &workInfo))
+                    {
+                        applog(LOG_INFO, "MTL: Accepted share! nonce=0x%08x", workInfo.data[19]);
+                    }
                 }
+            }
+
+            // Update nonce for next batch
+            nonce64 += workSize;
+            hashes_done_count += workSize;
+
+            // Check for nonce overflow
+            if (nonce64 >= maxNonce)
+            {
+                break;
+            }
+
+            // Hashrate reporting
+            auto hrTimerNow = std::chrono::steady_clock::now();
+            std::chrono::duration<double> hrTimerElapsed = hrTimerNow - hrTimerStart;
+
+            if (hrTimerElapsed.count() >= 5.0)
+            {
+                double avgHr = (double)hashes_done_count / hrTimerElapsed.count() / 1000.0;
+                applog(LOG_INFO, "mtl_device(%d): hashrate: %.02f kH/s", thr_id, avgHr);
+
+                mtx_lock(&stats_lock);
+                thr_hashrates[thr_id] = avgHr;
+                mtx_unlock(&stats_lock);
+
+                hashes_done_count = 0;
+                hrTimerStart = hrTimerNow;
             }
         }
 
-        // Update hashrate
-        hashes_done_count += workSize;
-
-        auto hrTimerNow = std::chrono::steady_clock::now();
-        std::chrono::duration<double> hrTimerElapsed = hrTimerNow - hrTimerStart;
-
-        if (hrTimerElapsed.count() >= 5.0)
-        {
-            double avgHr = (double)hashes_done_count / hrTimerElapsed.count() / 1000.0;
-            applog(LOG_INFO, "mtl_device: hashrate: %.02f kH/s", avgHr);
-
-            mtx_lock(&stats_lock);
-            thr_hashrates[thr_id] = avgHr;
-            mtx_unlock(&stats_lock);
-
-            hashes_done_count = 0;
-            hrTimerStart = hrTimerNow;
-        }
+        work_free(&workInfo);
     }
 
+out:
     // Cleanup
     applog(LOG_INFO, "MTL: Exiting worker thread id(%d)...", thr_id);
 
@@ -3675,8 +3725,6 @@ static int verthashMetal_thread(void *userdata)
     thr_hashrates[thr_id] = 0;
     mtx_unlock(&stats_lock);
 
-    free(h_results);
-    free(vh_data);
     mtl_cleanup_device(dev);
 
     tq_freeze(mythr->q);
